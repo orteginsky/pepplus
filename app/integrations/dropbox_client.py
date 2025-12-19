@@ -120,6 +120,48 @@ class DropboxClient:
             return None
         return self.handler.download_file(remote_path, local_folder)
 
+    # app/integrations/dropbox_client.py
+
+    def upload_file(self, local_path: str, dropbox_folder: str, overwrite: bool = True) -> Optional[str]:
+        """
+        Sube un archivo local a una carpeta de Dropbox.
+
+        Args:
+            local_path: Ruta local del archivo a subir.
+            dropbox_folder: Carpeta destino en Dropbox
+                            (ej. '/open cases/open cases/cliente/7 Submmisions Materials').
+            overwrite: Si True, sobrescribe si ya existe.
+        Returns:
+            Ruta remota en Dropbox (path_lower) o None si falla.
+        """
+        if not self.handler:
+            logger.warning("DropboxHandler not available, cannot upload file")
+            return None
+
+        logger.info(
+            "Uploading local file '%s' to Dropbox folder '%s' (overwrite=%s)",
+            local_path,
+            dropbox_folder,
+            overwrite,
+        )
+
+        try:
+            remote_path = self.handler.upload_file(
+                local_path=local_path,
+                dropbox_folder=dropbox_folder,
+                overwrite=overwrite,
+            )
+            return remote_path
+        except Exception as e:
+            logger.error(
+                "Error uploading file '%s' to Dropbox folder '%s': %s",
+                local_path,
+                dropbox_folder,
+                e,
+            )
+            return None
+
+
     @staticmethod
     def _normalize_name(name: str) -> str:
         """
@@ -267,3 +309,17 @@ class DropboxClient:
             len(matches),
         )
         return matches
+    def create_shared_link(self, remote_path: str) -> Optional[str]:
+        """
+        Crea o recupera un link compartido para un archivo en Dropbox.
+
+        Args:
+            remote_path: Ruta del archivo en Dropbox (path_lower).
+
+        Returns:
+            URL del link compartido o None si falla.
+        """
+        if not self.handler:
+            logger.warning("DropboxHandler not available, cannot create shared link")
+            return None
+        return self.handler.create_shared_link(remote_path)

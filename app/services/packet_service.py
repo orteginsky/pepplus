@@ -10,6 +10,8 @@ from reportlab.pdfgen import canvas
 from docx2pdf import convert as docx2pdf_convert
 import shutil
 import re
+import sys
+import subprocess
 
 from app.domain.manifest import Manifest
 from app.domain.packet import Packet
@@ -107,7 +109,7 @@ class PacketService:
                     "name": slot.name,
                     "required": slot.required,
                     "folder_hint": slot.meta.folder_hint,
-                    "file_hint": slot.meta.file_hint,              # ⬅️ NUEVO
+                    "file_hint": slot.meta.file_hint,
                     "filename_patterns": slot.meta.filename_patterns,
                     "tags": slot.meta.tags,
                 }
@@ -143,18 +145,14 @@ class PacketService:
         ]
 
         if missing_required:
+            # ⚠️ Ya no abortamos: solo registramos y continuamos
             logger.error("Missing required slots: %s", missing_required)
             if self.progress and packet.sheet_output_config:
                 self.progress.report(
                     packet.sheet_output_config,
                     packet.sheet_position,
-                    f"ERROR - Faltan slots requeridos: {missing_required}"
+                    f"ADVERTENCIA - Faltan slots requeridos: {missing_required}"
                 )
-            return {
-                "status": "error",
-                "message": f"Missing required slots: {missing_required}",
-                "missing_required": missing_required,
-            }
 
         # Reportar progreso: descargando
         if self.progress and packet.sheet_output_config:
@@ -167,33 +165,83 @@ class PacketService:
         if self.progress and packet.sheet_output_config:
             self.progress.report(packet.sheet_output_config, packet.sheet_position, "70% - Ensamblando PDF")
 
-        # Paso 3: Ensamblar PDF
+        # Paso 3: Ensamblar PDF (en disco local /tmp)
         output_path = self._merge(downloaded_paths, packet.client_name)
+
+        # Paso 4: Subir PDF final a Dropbox
+        dropbox_output_path: Optional[str] = None
+        if output_path and self.dropbox_client:
+            try:
+                target_folder = folder_path + "/9 VAWA/strategy"
+                logger.info(
+                    "Uploading final packet PDF for client '%s' to Dropbox folder '%s' from '%s'",
+                    packet.client_name,
+                    target_folder,
+                    output_path,
+                )
+
+                dropbox_output_path = self.dropbox_client.upload_file(
+                    local_path=str(output_path),
+                    dropbox_folder=target_folder,
+                    overwrite=True,
+                )
+
+                if dropbox_output_path:
+                    logger.info("Final packet uploaded to Dropbox: %s", dropbox_output_path)
+                    # Opcional: borrar archivo local
+                    try:
+                        Path(output_path).unlink(missing_ok=True)
+                        logger.info("Local packet file deleted after upload: %s", output_path)
+                    except Exception as del_err:
+                        logger.warning("Could not delete local packet file %s: %s", output_path, del_err)
+                else:
+                    logger.error(
+                        "Dropbox upload returned None for final packet (keeping local path %s)",
+                        output_path,
+                    )
+            except Exception as e:
+                logger.error("Error uploading final packet PDF to Dropbox: %s", e)
 
         # Reportar progreso: completado
         if self.progress and packet.sheet_output_config:
             self.progress.report(packet.sheet_output_config, packet.sheet_position, "100% - Completado")
-            # Escribir URL del PDF final (TODO: subir a GCS/Drive primero)
-            if output_path and self.sheets_client:
+
+            # Escribir URL del PDF final: preferir link compartido de Dropbox si existe
+            if (output_path or dropbox_output_path) and self.sheets_client:
+                url_for_sheet: Optional[str] = None
+
+                if dropbox_output_path and self.dropbox_client:
+                    # dropbox_output_path es el path interno en Dropbox (ej: '/open cases/.../packet_x.pdf')
+                    shared_url = self.dropbox_client.create_shared_link(dropbox_output_path)
+                    # Si no se pudo crear el link, al menos escribir el path interno como fallback
+                    url_for_sheet = shared_url or dropbox_output_path
+                else:
+                    # Fallback total: usar la ruta local del archivo
+                    url_for_sheet = str(output_path)
+
                 self.sheets_client.write_output_url(
                     packet.sheet_output_config,
                     packet.sheet_position,
-                    str(output_path)  # TODO: reemplazar con URL pública
+                    url_for_sheet
                 )
 
         logger.info(
-            "Finished packet processing client=%s output=%s files=%d",
+            "Finished packet processing client=%s output_local=%s output_dropbox=%s files=%d",
             packet.client_name,
             output_path,
+            dropbox_output_path,
             len(downloaded_paths),
         )
 
         resolved_slot_numbers = [res.slot.slot for res in resolved if not res.missing]
         presence_mask = packet.manifest.presence_mask(resolved_slot_numbers)
 
+        # 🔹 Nuevo: status flexible según si hubo faltantes
+        status = "ok_with_missing" if missing_required else "ok"
+
         return {
-            "status": "ok",
-            "output_path": str(output_path) if output_path else None,
+            "status": status,
+            "output_path": dropbox_output_path or (str(output_path) if output_path else None),
             "mask": presence_mask,
             "missing_required": missing_required,
         }
@@ -256,8 +304,6 @@ class PacketService:
         # Crear / limpiar carpeta temporal para este cliente
         client_folder = self._prepare_client_folder(client_name)
 
-
-
         downloaded: list[tuple[Slot, str]] = []
         for resolution in resolutions:
             if resolution.missing or not resolution.candidate_path:
@@ -287,7 +333,6 @@ class PacketService:
         logger.info("Downloaded %d/%d files", len(downloaded), len(list(resolutions)))
         return downloaded
 
-
     def _merge(self, downloaded: list[tuple[Slot, str]], client_name: str) -> Optional[Path]:
         """
         Ensambla los PDFs descargados en orden de slot, insertando
@@ -305,7 +350,7 @@ class PacketService:
         current_group_name: Optional[str] = None
 
         for slot, original_path in sorted_files:
-            group_name = slot.name  # p.ej. "Exhibit 1", "Exhibit 3", etc.
+            group_name = slot.name
 
             # Si cambia el grupo, insertar hoja separadora
             if group_name != current_group_name:
@@ -348,7 +393,6 @@ class PacketService:
 
         return output_path
 
-
     def _create_separator_pdf(self, title: str, client_name: str) -> Optional[str]:
         """
         Crea un PDF de una sola página con un título grande centrado.
@@ -383,30 +427,46 @@ class PacketService:
         except Exception as e:
             logger.error("Error creating separator PDF for '%s': %s", title, e)
             return None
+    
     def _ensure_pdf(self, path: str) -> Optional[str]:
-        """
-        Si el archivo ya es PDF, lo devuelve tal cual.
-        Si es DOCX, intenta convertirlo a PDF y devuelve la ruta del PDF.
-        Si falla, devuelve None.
-        """
         lower = path.lower()
         if lower.endswith(".pdf"):
             return path
 
         if lower.endswith(".docx"):
+            output_path = str(Path(path).with_suffix(".pdf"))
+
+            # Linux: usar LibreOffice
+            if sys.platform.startswith("linux"):
+                try:
+                    logger.info("Converting DOCX to PDF via LibreOffice: %s -> %s", path, output_path)
+                    subprocess.run(
+                        [
+                            "soffice",
+                            "--headless",
+                            "--convert-to", "pdf",
+                            "--outdir", str(Path(path).parent),
+                            path,
+                        ],
+                        check=True,
+                    )
+                    return output_path
+                except subprocess.CalledProcessError as e:
+                    logger.error("LibreOffice failed converting %s: %s", path, e)
+                    return None
+
+            # Windows / macOS: docx2pdf
             try:
-                # Generar ruta destino con misma base pero .pdf
-                output_path = str(Path(path).with_suffix(".pdf"))
-                logger.info("Converting DOCX to PDF: %s -> %s", path, output_path)
+                logger.info("Converting DOCX to PDF via docx2pdf: %s -> %s", path, output_path)
                 docx2pdf_convert(path, output_path)
                 return output_path
             except Exception as e:
                 logger.error("Error converting DOCX to PDF (%s): %s", path, e)
                 return None
 
-        # Otros tipos de archivo no soportados para el packet final
         logger.warning("Unsupported file type for merge (only pdf/docx): %s", path)
         return None
+
     def _prepare_client_folder(self, client_name: str) -> Path:
         """
         Prepara la carpeta temporal del cliente:

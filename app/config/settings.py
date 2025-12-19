@@ -1,6 +1,7 @@
 # app/config/settigs.py
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Dict
 
 class Settings(BaseSettings):
     # 🔧 Configuración del modelo / settings (sustituye a class Config)
@@ -50,13 +51,18 @@ class Settings(BaseSettings):
         description="URL of the enqueuer service for long-running jobs.",
     )
     tesseract_cmd: str | None = Field(
-        default=r"C:\Program Files\Tesseract-OCR\tessdata",
-        description="ubicación de la paqueteria"
+        default=None,
+        description="Ruta opcional al ejecutable de Tesseract (ej. /usr/bin/tesseract en Debian).",
     )
     poppler_path: str | None = Field(
-        default=r"C:\poppler\Library\bin",
-        description="ruta a bin para usar poppler"
+        default=None,
+        description="Directorio del binario de poppler (ej. /usr/bin en Debian). Deja vacío para usar el PATH.",
     )
+
+    gcp_location: str = Field(default="us-central1")
+    genai_model: str = Field(default="gemini-2.5-flash")
+    checklist_case_map: Dict[str, str] = Field(default_factory=dict)
+
 
 settings = Settings()
 

@@ -1,6 +1,7 @@
+#app/integrations/sheets_client.py
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Any
 
 try:
     from google.oauth2 import service_account
@@ -239,3 +240,66 @@ class SheetsClient:
         except Exception as e:
             logger.error("Unexpected error in batch update: %s", e)
             return False
+
+    def write_checklist_fields(
+        self,
+        config: SheetOutputConfig,
+        position,
+        *,
+        abuser_is_spouse: Optional[bool],
+        client_is_married: Optional[bool],
+        has_children: Optional[bool],
+        has_marriage: Optional[bool],
+    ) -> bool:
+        """
+        Escribe 4 campos del checklist en columnas separadas (YES/NO/UNKNOWN).
+        position debe tener: row, col_check_abuser_spouse, col_check_client_married,
+                            col_check_has_children, col_check_has_marriage
+        """
+        def tri_to_label(v: Optional[bool]) -> str:
+            if v is True:
+                return "YES"
+            if v is False:
+                return "NO"
+            return "UNKNOWN"
+
+        if not self.service:
+            logger.warning("SheetsClient service not initialized, skipping write_checklist_fields")
+            return False
+
+        sheet_name = config.sheet_name or "Sheet1"
+        updates = [
+            (position.row, position.col_check_abuser_spouse, tri_to_label(abuser_is_spouse)),
+            (position.row, position.col_check_client_married, tri_to_label(client_is_married)),
+            (position.row, position.col_check_has_children, tri_to_label(has_children)),
+            (position.row, position.col_check_has_marriage, tri_to_label(has_marriage)),
+        ]
+        return self.batch_update_cells(config.spreadsheet_id, sheet_name, updates)
+    
+    def write_cells(
+        self,
+        sheet_output_config: SheetOutputConfig,
+        row: int,
+        col_values: dict[int, str | int | float],
+    ) -> bool:
+        """
+        Escribe valores en múltiples columnas de una misma fila.
+        
+        Args:
+            sheet_output_config: Configuración de la hoja.
+            row: Número de fila.
+            col_values: Diccionario {indice_columna: valor}.
+        """
+        if not self.service:
+            logger.warning("SheetsClient service not initialized, skipping write_cells")
+            return False
+
+        sheet_name = sheet_output_config.sheet_name or "Sheet1"
+        
+        # Convertir el dict a la lista de tuplas que espera batch_update_cells
+        updates = []
+        for col, val in col_values.items():
+            # Asegurar que el valor sea string para evitar problemas de serialización simple
+            updates.append((row, col, str(val)))
+
+        return self.batch_update_cells(sheet_output_config.spreadsheet_id, sheet_name, updates)

@@ -11,10 +11,13 @@ from typing import Iterable, Optional
 try:
     import dropbox
     from dropbox.exceptions import ApiError, AuthError
+    from dropbox.files import WriteMode
 except ImportError:
     dropbox = None
     ApiError = Exception
     AuthError = Exception
+    WriteMode = None
+
 
 from app.logger import get_logger
 
@@ -177,3 +180,112 @@ class DropboxHandler:
         except ApiError as e:
             logger.error("Error obteniendo metadata de '%s': %s", file_path, e)
             return None
+    def upload_file(
+        self,
+        local_path: str,
+        dropbox_folder: str,
+        overwrite: bool = True,
+    ) -> Optional[str]:
+        """
+        Sube un archivo local a Dropbox.
+
+        Args:
+            local_path: Ruta local del archivo (en el servidor).
+            dropbox_folder: Carpeta remota destino (ej. '/open cases/open cases/...').
+            overwrite: Si True, sobrescribe si ya existe.
+
+        Returns:
+            Ruta remota (path_lower/path_display) o None si falla.
+        """
+        if dropbox is None or WriteMode is None:
+            logger.error("Dropbox SDK no está disponible. No se puede subir el archivo.")
+            return None
+
+        if not os.path.isfile(local_path):
+            logger.error("Local file not found for upload: %s", local_path)
+            return None
+
+        # Normalizar carpeta destino
+        folder = dropbox_folder.rstrip("/") if dropbox_folder else ""
+        if folder and not folder.startswith("/"):
+            folder = "/" + folder
+
+        filename = os.path.basename(local_path)
+        dropbox_path = f"{folder}/{filename}" if folder else f"/{filename}"
+
+        mode = WriteMode.overwrite if overwrite else WriteMode.add
+
+        logger.debug("Subiendo archivo local '%s' a Dropbox en '%s'", local_path, dropbox_path)
+
+        try:
+            with open(local_path, "rb") as f:
+                res = self.dbx.files_upload(
+                    f.read(),
+                    dropbox_path,
+                    mode=mode,
+                )
+
+            # path_lower es el path canónico en minúsculas
+            remote_path = getattr(res, "path_lower", None) or getattr(res, "path_display", dropbox_path)
+            logger.info("Archivo subido a Dropbox: %s", remote_path)
+            return remote_path
+
+        except ApiError as e:
+            logger.error(
+                "Error de API al subir archivo a Dropbox (local=%s, remote=%s): %s",
+                local_path,
+                dropbox_path,
+                e,
+            )
+            return None
+        except Exception as e:
+            logger.error(
+                "Error inesperado al subir archivo a Dropbox (local=%s, remote=%s): %s",
+                local_path,
+                dropbox_path,
+                e,
+            )
+            return None
+    def create_shared_link(self, file_path: str) -> Optional[str]:
+        """
+        Crea (o recupera) un link compartido para un archivo en Dropbox.
+
+        Args:
+            file_path: Ruta del archivo en Dropbox (path_lower), ej: '/open cases/.../packet_CAROLINA.pdf'
+
+        Returns:
+            URL del link compartido o None si falla
+        """
+        try:
+            logger.info("Creating shared link for Dropbox file: %s", file_path)
+            link_metadata = self.dbx.sharing_create_shared_link_with_settings(file_path)
+            url = getattr(link_metadata, "url", None)
+            if url:
+                logger.info("Shared link created: %s", url)
+            else:
+                logger.error("Shared link metadata returned without URL for %s", file_path)
+            return url
+
+        except ApiError as e:
+            # Caso típico: el link ya existe
+            try:
+                logger.warning(
+                    "Could not create shared link (maybe exists) for '%s': %s. Trying to list existing links.",
+                    file_path,
+                    e,
+                )
+                links_result = self.dbx.sharing_list_shared_links(path=file_path, direct_only=True)
+                if links_result.links:
+                    url = links_result.links[0].url
+                    logger.info("Reused existing shared link for %s: %s", file_path, url)
+                    return url
+                else:
+                    logger.error("No existing shared links found for %s", file_path)
+                    return None
+            except Exception as e2:
+                logger.error("Error listing existing shared links for %s: %s", file_path, e2)
+                return None
+        except Exception as e:
+            logger.error("Unexpected error creating shared link for %s: %s", file_path, e)
+            return None
+
